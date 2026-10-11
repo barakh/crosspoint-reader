@@ -378,6 +378,65 @@ uint32_t ParsedText::visibleOffsetAt(const size_t wordIndex) const {
   return visibleOffsetBaseAt(wordIndex) + wordVisibleOffsetDeltas[wordIndex];
 }
 
+uint32_t ParsedText::sourceOffsetAfter(const uint32_t start, const uint32_t renderedLength) const {
+  uint32_t end = start + renderedLength;
+  const auto* chunk =
+      absorbedSourceCursor && start >= absorbedSourceCursorStart ? absorbedSourceCursor : absorbedSourceHead.get();
+  while (chunk && chunk->base + chunk->deltas[chunk->count - 1] <= start) chunk = chunk->next.get();
+  absorbedSourceCursor = chunk;
+  absorbedSourceCursorStart = start;
+  for (; chunk; chunk = chunk->next.get()) {
+    const auto* first = chunk->deltas + chunk->begin;
+    const auto* last = chunk->deltas + chunk->count;
+    if (start >= chunk->base) first = std::upper_bound(first, last, start - chunk->base);
+    for (; first != last; ++first) {
+      if (chunk->base + *first > end) return end;
+      ++end;
+    }
+  }
+  return end;
+}
+
+bool ParsedText::recordAbsorbedSourceOffset(const uint32_t offset) {
+  if (!absorbedSourceTail || absorbedSourceTail->count == 64 || offset < absorbedSourceTail->base ||
+      offset - absorbedSourceTail->base > std::numeric_limits<uint16_t>::max()) {
+    // About 140 bytes per chunk on C3; sparse and paragraph-lived, with no large growth copy.
+    auto chunk = makeUniqueNoThrow<AbsorbedSourceChunk>();
+    if (!chunk) {
+      LOG_ERR("PTX", "OOM: NFC source offsets (%u bytes)", static_cast<unsigned>(sizeof(AbsorbedSourceChunk)));
+      droppedWords = true;
+      return false;
+    }
+    chunk->base = offset;
+    auto* tail = chunk.get();
+    if (absorbedSourceTail) {
+      absorbedSourceTail->next = std::move(chunk);
+    } else {
+      absorbedSourceHead = std::move(chunk);
+    }
+    absorbedSourceTail = tail;
+  }
+  absorbedSourceTail->deltas[absorbedSourceTail->count++] = static_cast<uint16_t>(offset - absorbedSourceTail->base);
+  return true;
+}
+
+void ParsedText::retireAbsorbedSourceOffsets(const uint32_t remainingStart) {
+  absorbedSourceCursor = nullptr;
+  while (absorbedSourceHead &&
+         absorbedSourceHead->base + absorbedSourceHead->deltas[absorbedSourceHead->count - 1] <= remainingStart) {
+    auto retired = std::move(absorbedSourceHead);
+    absorbedSourceHead = std::move(retired->next);
+  }
+  if (!absorbedSourceHead) {
+    absorbedSourceTail = nullptr;
+  } else if (remainingStart >= absorbedSourceHead->base) {
+    absorbedSourceHead->begin =
+        std::upper_bound(absorbedSourceHead->deltas, absorbedSourceHead->deltas + absorbedSourceHead->count,
+                         remainingStart - absorbedSourceHead->base) -
+        absorbedSourceHead->deltas;
+  }
+}
+
 void ParsedText::pushVisibleOffset(const uint32_t offset) {
   uint32_t base = visibleOffsetBase;
   if (wordVisibleOffsetDeltas.empty()) {
@@ -416,9 +475,12 @@ void ParsedText::eraseVisibleOffsetPrefix(const size_t count) {
     wordVisibleOffsetDeltas.clear();
     visibleOffsetRebases.clear();
     visibleOffsetBase = 0;
+    retireAbsorbedSourceOffsets(UINT32_MAX);
     return;
   }
 
+  const uint32_t remainingStart = visibleOffsetAt(count);
+  retireAbsorbedSourceOffsets(remainingStart);
   const uint32_t newBase = visibleOffsetBaseAt(count);
   wordVisibleOffsetDeltas.erase(wordVisibleOffsetDeltas.begin(), wordVisibleOffsetDeltas.begin() + count);
   size_t writeIndex = 0;
@@ -451,7 +513,18 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   // misplaced. Compose to NFC here, the single funnel every word passes through, so a
   // precomposed glyph is used instead. This runs once per word at layout time (the
   // result is cached in the section file) and is a cheap no-op for mark-free text.
-  word = utf8ComposeNfc(word);
+  struct SourceContext {
+    ParsedText* text;
+    uint32_t start;
+  } sourceContext{this, visibleTextOffset};
+  word = utf8ComposeNfc(
+      word,
+      [](const uint32_t offset, void* context) {
+        const auto& source = *static_cast<SourceContext*>(context);
+        return source.text->recordAbsorbedSourceOffset(source.start + offset);
+      },
+      &sourceContext);
+  if (word.empty()) return;
 
   EpdFontFamily::Style baseStyle = fontStyle;
   if (underline) {
@@ -469,12 +542,15 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
     WordStore::StoredWord stored;
     if (!storeWord(token, stored)) return;
     words.push_back(stored);
-    wordStyles.push_back(style);
+    // Small caps share the style byte's high bit with the discretionary-hyphen flag, so it
+    // rides in the size slot instead.
+    wordStyles.push_back(static_cast<EpdFontFamily::Style>(style & ~EpdFontFamily::SMALL_CAPS));
     wordContinues.push_back(continues);
     wordNoSpaceBefore.push_back(noSpaceBefore);
     wordFocusBoundary.push_back(focusBoundary);
     wordLinkIds.push_back(linkId);
-    wordSizeSlots.push_back(sizeSlot);
+    wordSizeSlots.push_back(
+        static_cast<uint8_t>(sizeSlot | ((style & EpdFontFamily::SMALL_CAPS) ? TextBlock::SMALL_CAPS_SLOT_FLAG : 0)));
     pushVisibleOffset(tokenOffset);
     if (padRuby && !rubyTexts.empty()) {
       rubyTexts.push_back("");
@@ -534,7 +610,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
       const std::string_view token(word.data() + tokenStart, breakOffset - tokenStart);
       pushToken(token, firstToken ? effectiveAttachToPrevious : false, firstToken ? effectiveNoSpaceBefore : true,
                 /*focusBoundary=*/0, tokenVisibleOffset);
-      tokenVisibleOffset += countCodepoints(token);
+      tokenVisibleOffset = sourceOffsetAfter(tokenVisibleOffset, countCodepoints(token));
       firstToken = false;
       tokenStart = breakOffset;
     }
@@ -575,12 +651,13 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   auto processSegment = [&](std::string_view segment, bool isWord, bool attach, bool noSpaceBefore) {
     const unsigned char* wordBegin = reinterpret_cast<const unsigned char*>(word.data());
     const unsigned char* segmentBegin = reinterpret_cast<const unsigned char*>(segment.data());
-    uint32_t segmentOffset = visibleTextOffset;
+    uint32_t segmentLength = 0;
     const unsigned char* offsetPtr = wordBegin;
     while (offsetPtr < segmentBegin) {
       utf8NextCodepoint(&offsetPtr);
-      segmentOffset++;
+      segmentLength++;
     }
+    const uint32_t segmentOffset = sourceOffsetAfter(visibleTextOffset, segmentLength);
     if (!isWord) {
       // Punctuation and Numbers stay regular
       pushStyledToken(segment, baseStyle, attach, noSpaceBefore, /*focusBoundary=*/0, segmentOffset, false);
@@ -861,7 +938,7 @@ int ParsedText::calculateRubyExtraStartOffset(const size_t wordIdx, const size_t
   }
   int groupActualWidth = 0;
   for (size_t k = 0; k < groupWordCount; ++k) {
-    groupActualWidth += measureWordWidth(renderer, fontId, wordAt(wordIdx + k), wordStyles[wordIdx + k],
+    groupActualWidth += measureWordWidth(renderer, fontId, wordAt(wordIdx + k), getWordStyleAt(wordIdx + k),
                                          blockStyle.characterSpacing, wordSpacingPercent);
   }
   const int rubyWidth =
@@ -906,8 +983,8 @@ int ParsedText::calculateRubyExtraEndOffset(const size_t lineStartIdx, const siz
   // Measure the group.
   int groupActualWidth = 0;
   for (size_t k = leaderIdx; k < lineBreakIdx; ++k) {
-    groupActualWidth +=
-        measureWordWidth(renderer, fontId, wordAt(k), wordStyles[k], blockStyle.characterSpacing, wordSpacingPercent);
+    groupActualWidth += measureWordWidth(renderer, fontId, wordAt(k), getWordStyleAt(k), blockStyle.characterSpacing,
+                                         wordSpacingPercent);
   }
   const int rubyWidth =
       renderer.getTextAdvanceX(fontId, rubyTexts[leaderIdx].c_str(), EpdFontFamily::SUP, blockStyle.characterSpacing);
@@ -919,7 +996,7 @@ int ParsedText::calculateRubyExtraEndOffset(const size_t lineStartIdx, const siz
 }
 
 int ParsedText::wordFontId(const size_t wordIndex, const int blockFontId) const {
-  const uint8_t slot = wordSizeSlots[wordIndex];
+  const uint8_t slot = wordSizeSlots[wordIndex] & ~TextBlock::SMALL_CAPS_SLOT_FLAG;
   return slot == 0 || sizeSlotFontIds[slot] == 0 ? blockFontId : sizeSlotFontIds[slot];
 }
 
@@ -941,7 +1018,7 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
   wordWidths.reserve(words.size());
 
   for (size_t i = 0; i < words.size(); ++i) {
-    wordWidths.push_back(measureFocusWordWidth(renderer, wordFontId(i, fontId), wordAt(i), wordStyles[i],
+    wordWidths.push_back(measureFocusWordWidth(renderer, wordFontId(i, fontId), wordAt(i), getWordStyleAt(i),
                                                wordFocusBoundary[i], blockStyle.characterSpacing, wordSpacingPercent));
   }
 
@@ -1086,13 +1163,13 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
       int gap = 0;
       if (j > static_cast<size_t>(i) && continuesVec[j]) {
         // Attached and breakable-attached boundaries both use kerning when kept on one line.
-        gap = renderer.getKerning(fontId, lastCodepoint(wordAt(j - 1)), firstCodepoint(wordAt(j)), wordStyles[j - 1],
-                                  blockStyle.characterSpacing);
+        gap = renderer.getKerning(fontId, lastCodepoint(wordAt(j - 1)), firstCodepoint(wordAt(j)),
+                                  getWordStyleAt(j - 1), blockStyle.characterSpacing);
       } else if (j > static_cast<size_t>(i) && noSpaceBeforeVec[j]) {
         gap = blockStyle.characterSpacing;
       } else if (j > static_cast<size_t>(i)) {
         gap = scaleSpace(renderer.getSpaceAdvance(fontId, lastCodepoint(wordAt(j - 1)), firstCodepoint(wordAt(j)),
-                                                  wordStyles[j - 1]),
+                                                  getWordStyleAt(j - 1)),
                          wordSpacingPercent);
       }
 
@@ -1199,13 +1276,13 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
         // Attached and breakable-attached boundaries both use kerning when kept on one line.
         spacing =
             renderer.getKerning(fontId, lastCodepoint(wordAt(currentIndex - 1)), firstCodepoint(wordAt(currentIndex)),
-                                wordStyles[currentIndex - 1], blockStyle.characterSpacing);
+                                getWordStyleAt(currentIndex - 1), blockStyle.characterSpacing);
       } else if (!isFirstWord && noSpaceBeforeVec[currentIndex]) {
         spacing = blockStyle.characterSpacing;
       } else if (!isFirstWord) {
         spacing =
             scaleSpace(renderer.getSpaceAdvance(fontId, lastCodepoint(wordAt(currentIndex - 1)),
-                                                firstCodepoint(wordAt(currentIndex)), wordStyles[currentIndex - 1]),
+                                                firstCodepoint(wordAt(currentIndex)), getWordStyleAt(currentIndex - 1)),
                        wordSpacingPercent);
       }
       const int candidateWidth = spacing + wordWidths[currentIndex];
@@ -1262,7 +1339,7 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   // Stable copy: Hyphenator and the prefix measurements below want std::string
   // semantics. Bounded by one word.
   const std::string word{wordAt(wordIndex)};  // brace-init: `word(` is an Arduino macro
-  const auto style = wordStyles[wordIndex];
+  const auto style = getWordStyleAt(wordIndex);
 
   const uint8_t focusBoundary = wordFocusBoundary[wordIndex];
 
@@ -1305,13 +1382,14 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
     return false;
   }
 
-  uint32_t remainderOffset = visibleOffsetAt(wordIndex);
+  uint32_t prefixLength = 0;
   const unsigned char* offsetPtr = reinterpret_cast<const unsigned char*>(word.data());
   const unsigned char* splitPtr = offsetPtr + chosenOffset;
   while (offsetPtr < splitPtr) {
     utf8NextCodepoint(&offsetPtr);
-    remainderOffset++;
+    prefixLength++;
   }
+  const uint32_t remainderOffset = sourceOffsetAfter(visibleOffsetAt(wordIndex), prefixLength);
 
   // Split the word at the selected breakpoint. The prefix is materialized as a
   // fresh arena entry (with its visible hyphen, so it stays NUL-terminated);
@@ -1337,10 +1415,13 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   }
   const WordStore::StoredWord remainderStored = WordStore::suffix(words[wordIndex], chosenOffset);
   words[wordIndex] = prefixStored;
+  const auto storedStyle = static_cast<EpdFontFamily::Style>(style & ~EpdFontFamily::SMALL_CAPS);
+  wordStyles[wordIndex] =
+      static_cast<EpdFontFamily::Style>(storedStyle | (chosenNeedsHyphen ? TextBlock::DISCRETIONARY_HYPHEN_FLAG : 0));
 
   // Insert the remainder word (with matching style and continuation flag) directly after the prefix.
   words.insert(words.begin() + wordIndex + 1, remainderStored);
-  wordStyles.insert(wordStyles.begin() + wordIndex + 1, style);
+  wordStyles.insert(wordStyles.begin() + wordIndex + 1, storedStyle);
   insertVisibleOffset(wordIndex + 1, remainderOffset);
   // Emphasis follows the text across the split, so a break at or after the boundary leaves the
   // remainder fully regular.
@@ -1429,7 +1510,9 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
       stripSoftHyphensInPlace(word);
     }
     lineWords.push_back(std::move(word));
-    lineWordStyles.push_back(wordStyles[lastBreakAt + i]);
+    // TextBlock keeps small caps with its word fonts (see attachWordFonts).
+    lineWordStyles.push_back(
+        static_cast<EpdFontFamily::Style>(getWordStyleAt(lastBreakAt + i) & ~EpdFontFamily::SMALL_CAPS));
   }
 
   // Calculate total word width for this line, count actual word gaps,
@@ -1747,14 +1830,16 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     }
   }
 
-  // Lines mixing sizes carry each word's font; slots resolving to the block font collapse to 0.
+  // Lines mixing sizes or using small caps carry per-word fonts; slots resolving to the block
+  // font collapse to 0.
   const auto attachWordFonts = [&](TextBlock& block) {
     int32_t fonts[TextBlock::MAX_WORD_FONTS] = {};
     uint8_t slots[128];
     if (lineWordCount > sizeof(slots)) return true;  // pathological line: keep the block font
     bool mixed = false;
     for (size_t i = 0; i < lineWordCount; ++i) {
-      const int wordFont = wordFontId(lastBreakAt + (willReorder ? visualOrderScratch[i] : i), fontId);
+      const size_t logical = lastBreakAt + (willReorder ? visualOrderScratch[i] : i);
+      const int wordFont = wordFontId(logical, fontId);
       uint8_t slot = 0;
       if (wordFont != fontId) {
         for (slot = 1; slot <= TextBlock::MAX_WORD_FONTS; ++slot) {
@@ -1763,8 +1848,8 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
         if (slot > TextBlock::MAX_WORD_FONTS) slot = 0;
         if (slot > 0) fonts[slot - 1] = wordFont;
       }
-      slots[i] = slot;
-      mixed = mixed || slot != 0;
+      slots[i] = static_cast<uint8_t>(slot | (wordSizeSlots[logical] & TextBlock::SMALL_CAPS_SLOT_FLAG));
+      mixed = mixed || slots[i] != 0;
     }
     return !mixed || block.setWordFonts(slots, fonts);
   };
@@ -1779,11 +1864,30 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     }
   }
 
+  // Preserve source coordinates through visual reordering and discretionary hyphens.
+  std::vector<TextBlock::SourceRange> sourceRanges;
+  sourceRanges.reserve(lineWordCount);
+  uint16_t paragraphStartWord = UINT16_MAX;
+  for (size_t i = 0; i < lineWordCount; ++i) {
+    const size_t logical = lastBreakAt + (willReorder ? visualOrderScratch[i] : i);
+    if (!firstLineConsumed && logical == 0) paragraphStartWord = static_cast<uint16_t>(i);
+    const uint32_t start = visibleOffsetAt(logical);
+    const bool discretionaryHyphen = (wordStyles[logical] & TextBlock::DISCRETIONARY_HYPHEN_FLAG) != 0;
+    uint32_t end = sourceOffsetAfter(start, countCodepoints(wordAt(logical)) - discretionaryHyphen);
+    if (discretionaryHyphen) {
+      lineWordStyles[i] = static_cast<EpdFontFamily::Style>(lineWordStyles[i] | TextBlock::DISCRETIONARY_HYPHEN_FLAG);
+    }
+    if (logical + 1 < words.size() && visibleOffsetAt(logical + 1) > start) {
+      end = std::min(end, visibleOffsetAt(logical + 1));
+    }
+    sourceRanges.push_back({start, end});
+  }
+
   if (!lineHasFocusSplit) {
     // TextBlock flattens the vectors into its arena; they stay owned here and die at return.
     auto block = makeUniqueNoThrow<TextBlock>(lineWords, lineXPos, lineWordStyles, std::vector<uint8_t>{},
                                               std::vector<uint16_t>{}, blockStyle, std::move(lineRubyTexts),
-                                              std::move(lineLinks));
+                                              std::move(lineLinks), sourceRanges, paragraphStartWord);
     if (!block || !block->valid() || !attachWordFonts(*block)) {
       LOG_ERR("PTX", "Dropping line: TextBlock or arena allocation failed");
       // Latch through the same flag as addWord() OOM: the caller releases the
@@ -1807,12 +1911,15 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     outBoundaries.push_back(boundary);
     const int wordFont = wordFontId(lastBreakAt + (willReorder ? visualOrderScratch[i] : i), fontId);
     outSuffixX.push_back(boundary == 0 ? 0
-                                       : measureFocusPrefixAdvance(renderer, wordFont, lineWords[i], lineWordStyles[i],
-                                                                   boundary, blockStyle.characterSpacing));
+                                       : measureFocusPrefixAdvance(
+                                             renderer, wordFont, lineWords[i],
+                                             getWordStyleAt(lastBreakAt + (willReorder ? visualOrderScratch[i] : i)),
+                                             boundary, blockStyle.characterSpacing));
   }
 
-  auto block = makeUniqueNoThrow<TextBlock>(lineWords, lineXPos, lineWordStyles, outBoundaries, outSuffixX, blockStyle,
-                                            std::move(lineRubyTexts), std::move(lineLinks));
+  auto block =
+      makeUniqueNoThrow<TextBlock>(lineWords, lineXPos, lineWordStyles, outBoundaries, outSuffixX, blockStyle,
+                                   std::move(lineRubyTexts), std::move(lineLinks), sourceRanges, paragraphStartWord);
   if (!block || !block->valid() || !attachWordFonts(*block)) {
     LOG_ERR("PTX", "Dropping line: TextBlock or arena allocation failed");
     droppedWords = true;  // see the non-focus branch above

@@ -263,6 +263,7 @@ TEST_F(ChapterHtmlSlimParserTest, SmallCapsSpanMarksWordsWithoutChangingText) {
   EXPECT_STREQ(block.wordText(1), "Chapter");
   EXPECT_EQ(block.wordStyle(0) & EpdFontFamily::SMALL_CAPS, 0);
   EXPECT_NE(block.wordStyle(1) & EpdFontFamily::SMALL_CAPS, 0);
+  EXPECT_FALSE(block.wordHasDiscretionaryHyphen(1));  // shares the style byte's high bit
   EXPECT_EQ(block.wordStyle(2) & EpdFontFamily::SMALL_CAPS, 0);
 }
 

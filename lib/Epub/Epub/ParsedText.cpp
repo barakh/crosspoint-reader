@@ -896,6 +896,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   // Remove consumed words so size() reflects only remaining words
   if (lineCount > 0) {
     firstLineConsumed = true;
+    paragraphStartEmitted = true;
 
     const size_t consumed = lineBreakIndices[lineCount - 1];
     for (size_t i = 0; i < consumed; ++i) {
@@ -1870,7 +1871,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   uint16_t paragraphStartWord = UINT16_MAX;
   for (size_t i = 0; i < lineWordCount; ++i) {
     const size_t logical = lastBreakAt + (willReorder ? visualOrderScratch[i] : i);
-    if (!firstLineConsumed && logical == 0) paragraphStartWord = static_cast<uint16_t>(i);
+    if (!paragraphStartEmitted && logical == 0) paragraphStartWord = static_cast<uint16_t>(i);
     const uint32_t start = visibleOffsetAt(logical);
     const bool discretionaryHyphen = (wordStyles[logical] & TextBlock::DISCRETIONARY_HYPHEN_FLAG) != 0;
     uint32_t end = sourceOffsetAfter(start, countCodepoints(wordAt(logical)) - discretionaryHyphen);

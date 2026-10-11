@@ -96,6 +96,9 @@ class ParsedText {
   bool droppedWords = false;
   int linesAfterCurrent = -1;
   bool firstLineConsumed = false;
+  // Separate from firstLineConsumed: a <br> line suppresses the indent but still starts a
+  // new clipping paragraph.
+  bool paragraphStartEmitted = false;
   std::vector<std::string> reorderedWordsScratch;
   std::vector<EpdFontFamily::Style> reorderedStylesScratch;
   std::vector<uint16_t> reorderedWidthsScratch;
@@ -150,15 +153,17 @@ class ParsedText {
   bool linkTargetMatches(uint8_t linkId, const char* href) const;
   void setRubyForWordAt(size_t index, const std::string& ruby);
   void setRubyGroupAt(size_t startIndex, size_t count, const std::string& ruby);
+  // The word's renderer style: stored flags removed, small caps restored from its size slot.
   EpdFontFamily::Style getWordStyleAt(size_t index) const {
-    return index < wordStyles.size()
-               ? static_cast<EpdFontFamily::Style>(wordStyles[index] & ~TextBlock::DISCRETIONARY_HYPHEN_FLAG)
-               : EpdFontFamily::REGULAR;
+    if (index >= wordStyles.size()) return EpdFontFamily::REGULAR;
+    const bool smallCaps = index < wordSizeSlots.size() && (wordSizeSlots[index] & TextBlock::SMALL_CAPS_SLOT_FLAG);
+    return static_cast<EpdFontFamily::Style>((wordStyles[index] & ~TextBlock::DISCRETIONARY_HYPHEN_FLAG) |
+                                             (smallCaps ? EpdFontFamily::SMALL_CAPS : 0));
   }
   std::string getRubyTextAt(size_t index) const { return index < rubyTexts.size() ? rubyTexts[index] : std::string(); }
   void ensureRubyCapacity();
   void suppressFirstLineIndent() { firstLineConsumed = true; }
-  void resetFirstLineIndent() { firstLineConsumed = false; }
+  void resetFirstLineIndent() { firstLineConsumed = paragraphStartEmitted = false; }
   void setBlockStyle(const BlockStyle& blockStyle) { this->blockStyle = blockStyle; }
   BlockStyle& getBlockStyle() { return blockStyle; }
   size_t size() const { return words.size(); }

@@ -157,7 +157,7 @@ int TextBlock::renderFontId(const GfxRenderer& renderer, const int fontId, const
 
 int TextBlock::wordFontId(const uint16_t i, const int sectionFontId) const {
   if (!wordFontData) return blockFontId(sectionFontId);
-  const uint8_t slot = wordFontData[sizeof(int32_t) * MAX_WORD_FONTS + i];
+  const uint8_t slot = wordFontData[sizeof(int32_t) * MAX_WORD_FONTS + i] & ~SMALL_CAPS_SLOT_FLAG;
   if (slot == 0) return blockFontId(sectionFontId);
   int32_t font = 0;
   memcpy(&font, wordFontData.get() + sizeof(int32_t) * (slot - 1), sizeof(font));
@@ -549,11 +549,12 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(HalFile& file) {
     }
     const uint8_t* slots = block->wordFontData.get() + sizeof(int32_t) * MAX_WORD_FONTS;
     for (uint16_t i = 0; i < wc; ++i) {
+      const uint8_t slot = slots[i] & ~SMALL_CAPS_SLOT_FLAG;
       int32_t font = 1;
-      if (slots[i] > 0 && slots[i] <= MAX_WORD_FONTS) {
-        memcpy(&font, block->wordFontData.get() + sizeof(int32_t) * (slots[i] - 1), sizeof(font));
+      if (slot > 0 && slot <= MAX_WORD_FONTS) {
+        memcpy(&font, block->wordFontData.get() + sizeof(int32_t) * (slot - 1), sizeof(font));
       }
-      if (slots[i] > MAX_WORD_FONTS || font == 0) {
+      if (slot > MAX_WORD_FONTS || font == 0) {
         LOG_ERR("TXB", "Deserialization failed: bad word font slot %u", slots[i]);
         return nullptr;
       }

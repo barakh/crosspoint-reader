@@ -22,6 +22,7 @@
 #include <XteinkDetect.h>
 #include <builtinFonts/all.h>
 #include <driver/gpio.h>
+#include <esp_heap_caps.h>
 #include <esp_sleep.h>
 
 #include <cstring>
@@ -383,8 +384,14 @@ static bool holdSleepWhileUsbPowered() {
   const auto powerPin = static_cast<gpio_num_t>(BoardConfig::ACTIVE.input.power);
   // The press that requested sleep may still be down; it must not end the hold.
   while (digitalRead(powerPin) == LOW) delay(10);  // Picco power button is active-low
+  // Keep the sleep frame so unplugging can remove the strip. 48 KB of PSRAM,
+  // freed when the hold ends.
+  const size_t frameSize = renderer.getBufferSize();
+  auto* const sleepFrame = static_cast<uint8_t*>(heap_caps_malloc(frameSize, MALLOC_CAP_SPIRAM));
+  if (sleepFrame) memcpy(sleepFrame, renderer.getFrameBuffer(), frameSize);
   const BatteryMonitor battery;
   int lastCharging = -1;
+  bool buttonPressed = false;
   while (gpio.isUsbConnected()) {
     const bool charging = battery.isCharging();
     if (static_cast<int>(charging) != lastCharging) {
@@ -396,10 +403,24 @@ static bool holdSleepWhileUsbPowered() {
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();
     gpio_wakeup_disable(powerPin);
+    // gpio_wakeup_disable() keeps the LOW_LEVEL type, and a later pinMode() would
+    // enable it as an interrupt that storms while the button is held.
+    gpio_set_intr_type(powerPin, GPIO_INTR_DISABLE);
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    if (digitalRead(powerPin) == LOW) return true;
+    if (digitalRead(powerPin) == LOW) {
+      buttonPressed = true;
+      break;
+    }
   }
-  return false;
+  if (sleepFrame) {
+    if (!buttonPressed) {
+      RenderLock lock;
+      memcpy(renderer.getFrameBuffer(), sleepFrame, frameSize);
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    }
+    heap_caps_free(sleepFrame);
+  }
+  return buttonPressed;
 }
 #endif
 
@@ -618,7 +639,9 @@ void setup() {
     case HalGPIO::WakeupReason::PowerButton:
       // With Short Power Button Press = Sleep, a single click wakes on any
       // device; otherwise the button must still be held (ghost-wake debounce).
-      if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
+      // Picco: plugging in USB pulses the wake line; power on, as stock does.
+      if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP &&
+          !(FREEINK_DEVICE_PICCO && gpio.isUsbConnected())) {
         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
         Storage.prepareForDeepSleep();
         powerManager.startDeepSleep(gpio);

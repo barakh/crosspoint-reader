@@ -245,13 +245,20 @@ void handleSlideSwitch() {
   if (!gpio.wasToggleSwitchChanged() && appliedAction == SETTINGS.slideSwitchAction) return;
   appliedAction = SETTINGS.slideSwitchAction;
   const bool on = gpio.isToggleSwitchOn();
-  if (SETTINGS.slideSwitchAction == CrossPointSettings::SLIDE_SWITCH_NIGHT_MODE) {
-    if ((SETTINGS.screenInverted != 0) == on) return;
-    SETTINGS.screenInverted = on ? 1 : 0;
-  } else {
-    if (!Frontlight.present() || Frontlight.isOn() == on) return;
-    Frontlight.setOn(on);
-    SETTINGS.frontlightOn = on ? 1 : 0;
+  switch (SETTINGS.slideSwitchAction) {
+    case CrossPointSettings::SLIDE_SWITCH_NIGHT_MODE:
+      if ((SETTINGS.screenInverted != 0) == on) return;
+      SETTINGS.screenInverted = on ? 1 : 0;
+      break;
+    case CrossPointSettings::SLIDE_SWITCH_TOUCH_CONTROLS:
+      if ((SETTINGS.touchReaderControls != CrossPointSettings::TOUCH_READER_OFF) == on) return;
+      SETTINGS.touchReaderControls = on ? CrossPointSettings::TOUCH_READER_ON : CrossPointSettings::TOUCH_READER_OFF;
+      break;
+    default:
+      if (!Frontlight.present() || Frontlight.isOn() == on) return;
+      Frontlight.setOn(on);
+      SETTINGS.frontlightOn = on ? 1 : 0;
+      break;
   }
   SETTINGS.saveToFile();
   activityManager.requestUpdate();

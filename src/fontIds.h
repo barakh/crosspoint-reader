@@ -9,9 +9,9 @@
 #define NOTOSANS_14_FONT_ID (-1413326613)
 #define NOTOSANS_16_FONT_ID (116566294)
 #define NOTOSANS_18_FONT_ID (-348426591)
-#define UI_10_FONT_ID (1322569422)
-#define UI_12_FONT_ID (1831230762)
-#define SMALL_FONT_ID (1465627787)
+#define UI_10_FONT_ID (-591848705)  // body UI font: Ubuntu @ 24pt (enlarged custom build)
+#define UI_12_FONT_ID (-1493951867)   // title UI font: Ubuntu @ 28pt (enlarged custom build)
+#define SMALL_FONT_ID (-604416600)  // small UI font: NotoSans @ 20pt (enlarged custom build)
 
 // Font ID 0 is reserved as the "not found" sentinel.
 // Guard against any hash accidentally producing 0.

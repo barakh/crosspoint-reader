@@ -61,9 +61,9 @@ struct UiFontSize {
   uint8_t pointSize;
 };
 constexpr UiFontSize kUiFontSizes[] = {
-    {SMALL_FONT_ID, 8},
-    {UI_10_FONT_ID, 10},
-    {UI_12_FONT_ID, 12},
+    {SMALL_FONT_ID, 10},
+    {UI_10_FONT_ID, 12},
+    {UI_12_FONT_ID, 14},
 };
 
 }  // namespace
